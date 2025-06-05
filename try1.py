@@ -96,19 +96,34 @@ class NCA_Model_3x3(nn.Module):
     Angepasstes NCA-Modell, das 3x3 Convolutions verwendet, um die Nachbarschaft direkt zu verarbeiten.
     Dies ist die gängigere Implementierung für "Neural Cellular Automata".
     """
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, logbook=None, model_id="N/A"):
         """
         Initialisiert das NCA-Modell mit 3x3 Convolution-Schichten.
         :param in_channels: Anzahl der Eingangskanäle (NCA_STATE_CHANNELS).
         :param hidden_channels: Anzahl der Kanäle in den verdeckten Schichten.
         :param out_channels: Anzahl der Ausgangskanäle (NCA_STATE_CHANNELS).
+        :param logbook: Optional Logbook instance for XBA logging.
+        :param model_id: Optional model identifier for logging.
         """
         super().__init__()
+        self.logbook = logbook
+        self.model_id = model_id
         # PyTorch Conv2d erwartet (batch, channels, H, W)
         # padding='same' sorgt dafür, dass die Output-Dimensionen die gleichen wie die Input-Dimensionen sind.
         self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=hidden_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(in_channels=hidden_channels, out_channels=out_channels, kernel_size=3, padding=1)
         self.relu = nn.ReLU() # Nicht-Linearität
+
+        # XBA attributes
+        # Initialize with dummy sizes, will be properly sized in the first forward pass or when state is known
+        self.mean_abs_grad_conv1 = torch.zeros(hidden_channels, device=DEVICE)
+        self.mean_abs_grad_conv2 = torch.zeros(out_channels, device=DEVICE)
+        self.std_output_conv1 = torch.zeros(hidden_channels, device=DEVICE)
+        self.std_output_conv2 = torch.zeros(out_channels, device=DEVICE)
+        self.xba_logging_data = [] # Can still be used for model's internal quick logging if needed
+        self._conv1_hook_handle = None
+        self._conv2_hook_handle = None
+        # self.logbook and self.model_id are already set above
 
     def forward(self, state):
         """
@@ -117,26 +132,234 @@ class NCA_Model_3x3(nn.Module):
         :return: Das berechnete Delta für die Zustandsaktualisierung.
                  (Batch_size, Channels, Height, Width)
         """
-        x = self.conv1(state)
-        x = self.relu(x)
-        x = self.conv2(x)
-        return x
+        # Ensure hooks are registered if not already
+        if self._conv1_hook_handle is None:
+            self._conv1_hook_handle = self.conv1.weight.register_hook(self._grad_hook_conv1)
+        if self._conv2_hook_handle is None:
+            self._conv2_hook_handle = self.conv2.weight.register_hook(self._grad_hook_conv2)
 
-def nca_step_function(state, model):
+        # Forward pass
+        out1 = self.conv1(state)
+        # Calculate std_output for conv1 neurons (output channels of conv1)
+        # Output shape: (batch_size, hidden_channels, H, W)
+        # We want std per output channel, across batch, H, W
+        # Calculate std_output regardless of requires_grad for XBA visualization purposes
+        # This assumes that if XBA is active, these stats are useful.
+        # If performance is critical, a flag could control this.
+        self.std_output_conv1 = torch.std(out1, dim=(0, 2, 3)) # Shape: (hidden_channels,)
+
+        x = self.relu(out1)
+
+        out2 = self.conv2(x)
+        # Calculate std_output for conv2 neurons (output channels of conv2)
+        # Output shape: (batch_size, out_channels, H, W)
+        self.std_output_conv2 = torch.std(out2, dim=(0, 2, 3)) # Shape: (out_channels,)
+
+        return out2
+
+    def _grad_hook_conv1(self, grad):
+        """Hook to capture gradients for conv1 layer's weights."""
+        if grad is not None:
+            # grad shape for conv1.weight: (out_channels, in_channels, kH, kW)
+            # We want mean absolute gradient per output neuron (filter)
+            # So, calculate mean abs grad for each output channel's filter weights
+            abs_grad = torch.abs(grad)
+            # Mean over in_channels, kH, kW for each output filter
+            self.mean_abs_grad_conv1 = torch.mean(abs_grad, dim=(1, 2, 3)) # Shape: (out_channels_conv1,)
+
+    def _grad_hook_conv2(self, grad):
+        """Hook to capture gradients for conv2 layer's weights."""
+        if grad is not None:
+            # grad shape for conv2.weight: (out_channels, in_channels, kH, kW)
+            abs_grad = torch.abs(grad)
+            self.mean_abs_grad_conv2 = torch.mean(abs_grad, dim=(1, 2, 3)) # Shape: (out_channels_conv2,)
+
+    def identify_dead_neurons(self, epsilon=1e-6, std_threshold=1e-4):
+        """
+        Identifiziert Neuronen, die als "tot" betrachtet werden können.
+        :param epsilon: Schwellenwert für den mittleren absoluten Gradienten.
+        :param std_threshold: Schwellenwert für die Standardabweichung des Outputs.
+        :return: Tuple von Tensoren: (dead_conv1_indices, dead_conv2_indices)
+        """
+        # Dead neurons for conv1 (output channels of conv1 are its neurons)
+        dead_conv1_mask = (self.mean_abs_grad_conv1 < epsilon) & (self.std_output_conv1 < std_threshold)
+        dead_conv1_indices = torch.where(dead_conv1_mask)[0]
+
+        # Dead neurons for conv2 (output channels of conv2 are its neurons)
+        dead_conv2_mask = (self.mean_abs_grad_conv2 < epsilon) & (self.std_output_conv2 < std_threshold)
+        dead_conv2_indices = torch.where(dead_conv2_mask)[0]
+
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Log to model's internal xba_logging_data with structured dicts
+        if dead_conv1_indices.numel() > 0:
+            log_entry_conv1 = {
+                'timestamp': current_time, 'type': 'identification', 'model_id': self.model_id,
+                'layer': 'conv1', 'neurons': dead_conv1_indices.tolist(),
+                'details': {
+                    'mean_abs_grad': self.mean_abs_grad_conv1[dead_conv1_indices].cpu().tolist(),
+                    'std_output': self.std_output_conv1[dead_conv1_indices].cpu().tolist(),
+                    'epsilon_threshold': epsilon, 'std_dev_threshold': std_threshold
+                }
+            }
+            self.xba_logging_data.append(log_entry_conv1)
+            if self.logbook: # Also log to global logbook if available
+                self.logbook.log_xba_identification(
+                    timestamp=current_time, model_id=self.model_id, layer_name='conv1',
+                    neuron_indices=dead_conv1_indices,
+                    details=f"MAG_mean={torch.mean(self.mean_abs_grad_conv1[dead_conv1_indices]).item():.2e}, StdOut_mean={torch.mean(self.std_output_conv1[dead_conv1_indices]).item():.2e}"
+                )
+
+        if dead_conv2_indices.numel() > 0:
+            log_entry_conv2 = {
+                'timestamp': current_time, 'type': 'identification', 'model_id': self.model_id,
+                'layer': 'conv2', 'neurons': dead_conv2_indices.tolist(),
+                'details': {
+                    'mean_abs_grad': self.mean_abs_grad_conv2[dead_conv2_indices].cpu().tolist(),
+                    'std_output': self.std_output_conv2[dead_conv2_indices].cpu().tolist(),
+                    'epsilon_threshold': epsilon, 'std_dev_threshold': std_threshold
+                }
+            }
+            self.xba_logging_data.append(log_entry_conv2)
+            if self.logbook: # Also log to global logbook if available
+                self.logbook.log_xba_identification(
+                    timestamp=current_time, model_id=self.model_id, layer_name='conv2',
+                    neuron_indices=dead_conv2_indices,
+                    details=f"MAG_mean={torch.mean(self.mean_abs_grad_conv2[dead_conv2_indices]).item():.2e}, StdOut_mean={torch.mean(self.std_output_conv2[dead_conv2_indices]).item():.2e}"
+                )
+
+        return dead_conv1_indices, dead_conv2_indices
+
+    def reactivate_neurons(self, dead_conv1_indices, dead_conv2_indices, reactivation_method='reinitialize'):
+        """
+        Reaktiviert tote Neuronen.
+        :param dead_conv1_indices: Indizes der toten Neuronen in conv1.
+        :param dead_conv2_indices: Indizes der toten Neuronen in conv2.
+        :param reactivation_method: 'reinitialize' oder 'inject_noise'.
+        """
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with torch.no_grad():
+            # Reactivate conv1 neurons
+            if dead_conv1_indices.numel() > 0:
+                for idx in dead_conv1_indices: # Iterate for precise application
+                    if reactivation_method == 'reinitialize':
+                        nn.init.kaiming_normal_(self.conv1.weight[idx, :, :, :])
+                        if self.conv1.bias is not None:
+                             nn.init.zeros_(self.conv1.bias[idx])
+                    elif reactivation_method == 'inject_noise':
+                        noise_w = torch.randn_like(self.conv1.weight[idx, :, :, :]) * 0.01
+                        self.conv1.weight[idx, :, :, :].add_(noise_w)
+                        if self.conv1.bias is not None:
+                            noise_b = torch.randn_like(self.conv1.bias[idx]) * 0.01
+                            self.conv1.bias[idx].add_(noise_b)
+
+                if self.logbook:
+                    self.logbook.log_xba_action(
+                        timestamp=current_time, model_id=self.model_id, layer_name='conv1',
+                        neuron_indices=dead_conv1_indices, action_type=reactivation_method,
+                        details=f"{dead_conv1_indices.numel()} neurons affected"
+                    )
+                # Always log to model's internal xba_logging_data with structured dict
+                self.xba_logging_data.append({
+                    'timestamp': current_time, 'type': 'reactivation', 'model_id': self.model_id,
+                    'layer': 'conv1', 'neurons': dead_conv1_indices.tolist(),
+                    'method': reactivation_method,
+                    'count': dead_conv1_indices.numel()
+                })
+
+            # Reactivate conv2 neurons
+            if dead_conv2_indices.numel() > 0:
+                for idx in dead_conv2_indices: # Iterate for precise application
+                    if reactivation_method == 'reinitialize':
+                        nn.init.kaiming_normal_(self.conv2.weight[idx, :, :, :])
+                        if self.conv2.bias is not None:
+                            nn.init.zeros_(self.conv2.bias[idx])
+                    elif reactivation_method == 'inject_noise':
+                        noise_w = torch.randn_like(self.conv2.weight[idx, :, :, :]) * 0.01
+                        self.conv2.weight[idx, :, :, :].add_(noise_w)
+                        if self.conv2.bias is not None:
+                            noise_b = torch.randn_like(self.conv2.bias[idx]) * 0.01
+                            self.conv2.bias[idx].add_(noise_b)
+
+                if self.logbook:
+                    self.logbook.log_xba_action(
+                        timestamp=current_time, model_id=self.model_id, layer_name='conv2',
+                        neuron_indices=dead_conv2_indices, action_type=reactivation_method,
+                        details=f"{dead_conv2_indices.numel()} neurons affected"
+                    )
+                # Always log to model's internal xba_logging_data with structured dict
+                self.xba_logging_data.append({
+                    'timestamp': current_time, 'type': 'reactivation', 'model_id': self.model_id,
+                    'layer': 'conv2', 'neurons': dead_conv2_indices.tolist(),
+                    'method': reactivation_method,
+                    'count': dead_conv2_indices.numel()
+                })
+
+    def remove_hooks(self):
+        """Removes gradient hooks if they exist."""
+        if self._conv1_hook_handle is not None:
+            self._conv1_hook_handle.remove()
+            self._conv1_hook_handle = None
+        if self._conv2_hook_handle is not None:
+            self._conv2_hook_handle.remove()
+            self._conv2_hook_handle = None
+
+
+def nca_step_function(state, model, current_step=0, xba_enabled=False, xba_check_interval=10,
+                        epsilon=1e-6, std_threshold=1e-4, reactivation_method='reinitialize'):
     """
     Führt einen Simulationsschritt basierend auf lokalen Regeln des NCA-Modells aus.
     Dieser Schritt ist differenzierbar.
     :param state: Der aktuelle Zustand des NCA-Gitters (Batch_size, Channels, Height, Width).
     :param model: Das trainierte NCA_Model (NCA_Model_3x3 Instanz).
+    :param current_step: Der aktuelle Simulationsschritt (für XBA).
+    :param xba_enabled: Ob XBA aktiviert ist.
+    :param xba_check_interval: Intervall für XBA-Prüfungen.
+    :param epsilon: Epsilon-Wert für XBA identify_dead_neurons.
+    :param std_threshold: Std_threshold-Wert für XBA identify_dead_neurons.
+    :param reactivation_method: Methode für XBA reactivate_neurons.
     :return: Der neue Zustand des NCA-Gitters nach einem Schritt.
     """
+    # XBA Logic
+    if xba_enabled and (current_step % xba_check_interval == 0) and current_step > 0:
+        # Ensure model is in training mode for gradients to be available if XBA is used during training
+        # However, nca_step_function can be called with torch.no_grad() context,
+        # in which case mean_abs_grad might not be up-to-date.
+        # XBA is typically more relevant during training.
+        # For now, we assume if xba_enabled, the necessary grads for mean_abs_grad were computed.
+
+        # It's important that model(state) runs before identify_dead_neurons if identify_dead_neurons
+        # relies on std_output from the current forward pass, and that backward() has been called
+        # for mean_abs_grad to be populated.
+        # Given nca_step_function is one step, backward() is usually called after many such steps.
+        # This implies mean_abs_grad is from a *previous* training iteration's backward pass.
+        # std_output is from the *current* forward pass if model(state) is called before this block.
+        # Let's call model(state) first, then XBA.
+        pass # XBA logic will be inserted after delta_state calculation
+
     # 1. Lebendigkeitsmaske vor der Aktualisierung (um tote Zellen nicht zu aktualisieren)
     # Diese Maske wird verwendet, um zu verhindern, dass die Aktualisierung an bereits toten Zellen stattfindet,
     # die keine Nachbarverbindung zu lebenden Zellen haben.
     pre_living_mask = get_living_mask(state)
 
     # 2. Berechne das Delta mit dem NCA-Modell
-    delta_state = model(state)
+    delta_state = model(state) # This populates std_output if model is in training mode
+
+    # XBA Logic - Placed after model(state) call to use current std_output
+    if xba_enabled and (current_step % xba_check_interval == 0) and current_step > 0:
+        # Note: mean_abs_grad would be from the *last optimizer step*.
+        # std_output is from the *current forward pass* (model(state) above).
+        # This timing is typical for such interventions.
+        if hasattr(model, 'identify_dead_neurons') and hasattr(model, 'reactivate_neurons'):
+            dead_conv1_indices, dead_conv2_indices = model.identify_dead_neurons(epsilon, std_threshold)
+            if dead_conv1_indices.numel() > 0 or dead_conv2_indices.numel() > 0:
+                logger.info(f"[XBA Interv@step {current_step}] Identifying dead neurons. Conv1: {dead_conv1_indices.tolist()}, Conv2: {dead_conv2_indices.tolist()}")
+                model.reactivate_neurons(dead_conv1_indices, dead_conv2_indices, reactivation_method)
+                logger.info(f"[XBA Interv@step {current_step}] Attempted reactivation using '{reactivation_method}'.")
+        else:
+            logger.warning(f"[XBA Interv@step {current_step}] XBA enabled but model missing XBA methods.")
+
 
     # 3. Zufällige Aktualisierungsmaske (Stochastic Update)
     # Ein wichtiges Element in NCAs für Selbstorganisation und Reduzierung von Mustern.
@@ -268,13 +491,23 @@ class Growth_Trainer:
         :return: Den aktuellen Verlust.
         """
         self.optimizer.zero_grad()
+        self.model.train() # Ensure model is in training mode for hooks and XBA stats
 
         # Generiere einen initialen Seed
         state = initial_seed_generator(NCA_GRID_SIZE, NCA_STATE_CHANNELS, batch_size=1, seed_type='center_pixel')
         
         # Simuliere NCA-Wachstum über mehrere Schritte
-        for _ in range(num_steps):
-            state = nca_step_function(state, self.model)
+        for step_idx in range(num_steps):
+            # XBA default parameters for Growth_Trainer
+            state = nca_step_function(
+                state, self.model,
+                current_step=step_idx + 1, # Step counts usually start from 1
+                xba_enabled=True, # Enable XBA during growth training
+                xba_check_interval=10, # Check every 10 steps
+                epsilon=1e-7, # Slightly lower epsilon for more sensitivity
+                std_threshold=1e-5, # Slightly lower std_threshold
+                reactivation_method='reinitialize'
+            )
 
         # Extrahiere die RGB-Kanäle des finalen Zustands
         final_rgb = to_rgb(state)
@@ -364,8 +597,18 @@ class StressTest_Env(gym.Env):
         
         # Lasse den NCA einige Schritte "vorwachsen", um eine initiale Struktur zu bilden
         with torch.no_grad(): # Kein Gradient Tracking während der Reset-Phase
-            for _ in range(NCA_STEPS_PER_GROWTH // 2): # Halbe Anzahl der normalen Wachstumsschritte
-                self.current_nca_state = nca_step_function(self.current_nca_state, self.nca_model)
+            self.nca_model.eval() # Set model to eval mode if not training
+            for step_idx in range(NCA_STEPS_PER_GROWTH // 2): # Halbe Anzahl der normalen Wachstumsschritte
+                self.current_nca_state = nca_step_function(
+                    self.current_nca_state, self.nca_model,
+                    current_step=step_idx + 1,
+                    xba_enabled=False, # XBA typically not used in no_grad/eval contexts like reset
+                                       # or if used, ensure grads are not required by XBA parts
+                    xba_check_interval=10,
+                    epsilon=1e-6,
+                    std_threshold=1e-4,
+                    reactivation_method='reinitialize'
+                )
         
         observation = self._get_obs()
         info = self._get_info()
@@ -407,7 +650,21 @@ class StressTest_Env(gym.Env):
 
         # 2. Lasse den NCA für einen Schritt "heilen" oder weiterwachsen
         with torch.no_grad(): # Kein Gradient Tracking während der RL-Simulation
-            self.current_nca_state = nca_step_function(self.current_nca_state, self.nca_model)
+            self.nca_model.eval() # Set model to eval mode
+            # current_step for StressTest_Env step, assuming each call is one logical step in its context
+            # If StressTest_Env has its own step counter, it should be used.
+            # For now, let's assume a single step, so current_step=1 or 0.
+            # If XBA were to be active here, a step counter would be needed for `xba_check_interval`.
+            # For now, disabling XBA as it's usually for training.
+            self.current_nca_state = nca_step_function(
+                self.current_nca_state, self.nca_model,
+                current_step=1, # Placeholder, ideally env would track its own steps if XBA is on
+                xba_enabled=False, # XBA typically not used in no_grad/eval contexts
+                xba_check_interval=10,
+                epsilon=1e-6,
+                std_threshold=1e-4,
+                reactivation_method='reinitialize'
+            )
         
         # 3. Belohnungsberechnung
         current_living_cells = get_living_mask(self.current_nca_state).sum().item()
@@ -782,7 +1039,18 @@ class Selection_Loop:
         :param score: Der Gesamtscore (z.B. durchschnittliche Belohnung aus SimRunner).
         """
         # Kopiere das Modell, um Probleme mit Referenzen zu vermeiden
-        model_copy = NCA_Model_3x3(NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS).to(DEVICE)
+        # Pass logbook and model_id from the original model if available
+        logbook_to_pass = getattr(nca_model, 'logbook', None)
+        # For model_id, we might want to assign a new ID to copies, or specify copy status
+        # For now, let's try to keep the original ID for traceability, or append a suffix.
+        original_model_id = getattr(nca_model, 'model_id', "unknown_orig")
+        copied_model_id = f"{original_model_id}_sel_copy"
+
+
+        model_copy = NCA_Model_3x3(
+            NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS,
+            logbook=logbook_to_pass, model_id=copied_model_id
+        ).to(DEVICE)
         model_copy.load_state_dict(nca_model.state_dict())
         
         # Füge das Modell und seinen Score hinzu
@@ -790,7 +1058,9 @@ class Selection_Loop:
         # Sortiere nach Score (höher ist besser)
         self.best_nca_models = deque(sorted(self.best_nca_models, key=lambda x: x['score'], reverse=True)[:self.population_size])
         
-        logger.debug(f"NCA-Modell mit Score {score:.2f} registriert. Aktuelle Population Top-Scores: {[f'{m['score']:.2f}' for m in self.best_nca_models]}")
+        # Corrected f-string syntax for the list comprehension part
+        top_scores_str = ", ".join([f"{item['score']:.2f}" for item in self.best_nca_models])
+        logger.debug(f"NCA-Modell mit Score {score:.2f} registriert. Aktuelle Population Top-Scores: [{top_scores_str}]")
 
     def get_best_model(self):
         """Gibt das aktuell beste Modell zurück."""
@@ -810,13 +1080,22 @@ class Mutation_Engine:
         self.mutation_rate = mutation_rate
         self.mutation_strength = mutation_strength
 
-    def mutate(self, nca_model):
+    def mutate(self, nca_model, logbook=None, new_model_id="mutated_N/A"):
         """
         Mutiert die Parameter eines NCA-Modells.
         :param nca_model: Das zu mutierende NCA-Modell.
+        :param logbook: Optional Logbook instance to assign to the mutated model.
+        :param new_model_id: Optional new model_id for the mutated model.
         :return: Ein neues, mutiertes NCA-Modell.
         """
-        mutated_model = NCA_Model_3x3(NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS).to(DEVICE)
+        # The parent model's logbook is nca_model.logbook.
+        # If a specific logbook is passed for the child, use it, else inherit from parent.
+        logbook_for_child = logbook if logbook is not None else getattr(nca_model, 'logbook', None)
+
+        mutated_model = NCA_Model_3x3(
+            NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS,
+            logbook=logbook_for_child, model_id=new_model_id
+        ).to(DEVICE)
         mutated_model.load_state_dict(nca_model.state_dict()) # Kopiere die Gewichte des Elternmodells
 
         with torch.no_grad():
@@ -846,12 +1125,16 @@ class Evolution_Controller:
     def initialize_population(self):
         """Erstellt die initiale Population von NCA-Modellen."""
         self.current_nca_population = []
-        for _ in range(self.population_size):
-            new_nca_model = NCA_Model_3x3(NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS).to(DEVICE)
+        for i in range(self.population_size):
+            model_id = f"gen0_model{i}" # Assign a unique ID for each model
+            new_nca_model = NCA_Model_3x3(
+                NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS,
+                logbook=self.logbook, model_id=model_id
+            ).to(DEVICE)
             # Optional: Initiales Wachstumstraining für jedes neue Modell, um eine Grundfähigkeit zu etablieren
             # Für eine Demo lassen wir dies aus, um die Evolution schneller zu sehen.
             self.current_nca_population.append(new_nca_model)
-        logger.info(f"Initialisiere Population mit {self.population_size} NCA-Modellen.")
+        logger.info(f"Initialisiere Population mit {self.population_size} NCA-Modellen (Logbook und Model ID injiziert).")
 
     def run_evolution(self):
         """Führt den evolutionären Prozess über mehrere Generationen aus."""
@@ -875,10 +1158,23 @@ class Evolution_Controller:
                 
                 all_positive_examples.extend(pos_ex)
                 all_negative_examples.extend(neg_ex)
-                
-                generation_model_scores.append({'model': nca_model, 'avg_reward': avg_reward, 'pos_ex': pos_ex, 'neg_ex': neg_ex})
 
-                logger.info(f"Modell {i+1} abgeschlossen. Avg. Belohnung: {avg_reward:.2f}")
+                # Calculate XBA effectiveness metric for this model
+                num_xba_reactivations = 0
+                if hasattr(nca_model, 'xba_logging_data'):
+                    for log_item in nca_model.xba_logging_data:
+                        if isinstance(log_item, dict) and log_item.get('type') == 'reactivation':
+                            num_xba_reactivations += log_item.get('count', 0) # Sum counts from each reactivation event
+
+                generation_model_scores.append({
+                    'model': nca_model,
+                    'avg_reward': avg_reward,
+                    'pos_ex': pos_ex,
+                    'neg_ex': neg_ex,
+                    'num_xba_reactivations': num_xba_reactivations # Store XBA metric
+                })
+
+                logger.info(f"Modell {i+1} ({nca_model.model_id}) abgeschlossen. Avg. Belohnung: {avg_reward:.2f}, XBA Reactivations: {num_xba_reactivations}")
                 
             # Phase 2: Trainiere den Validator mit den gesammelten Beispielen dieser Generation
             if all_positive_examples and all_negative_examples:
@@ -916,40 +1212,67 @@ class Evolution_Controller:
 
                 # Kombiniere RL-Belohnung und Validierungs-Score für den endgültigen Score
                 # Der Validierungs-Score ist von 0 bis 1. Multipliziere ihn, um seinen Einfluss zu gewichten.
-                combined_score = avg_reward + validation_avg_score * 10 
+                xba_effectiveness_score = item.get('num_xba_reactivations', 0)
+                xba_weight = 0.05 # Weight for XBA score, tune as needed
+
+                combined_score = avg_reward + (validation_avg_score * 10) + (xba_effectiveness_score * xba_weight)
 
                 current_generation_scores.append(combined_score)
-                self.selection_loop.register_nca_model(nca_model, combined_score) # Registriere Modelle mit ihrem kombinierten Score
+                # Pass the original model object (nca_model) to register_nca_model
+                self.selection_loop.register_nca_model(nca_model, combined_score)
 
             # Logge die Zusammenfassung der Generation
             best_gen_score = max(current_generation_scores) if current_generation_scores else 0.0
             avg_gen_score = np.mean(current_generation_scores) if current_generation_scores else 0.0
+            avg_xba_score_this_gen = np.mean([s.get('num_xba_reactivations', 0) for s in generation_model_scores]) if generation_model_scores else 0.0
+
             self.logbook.log_generation_summary(
                 generation=generation+1,
                 best_score=best_gen_score,
                 avg_score=avg_gen_score,
                 num_pos_examples=len(all_positive_examples),
-                num_neg_examples=len(all_negative_examples)
+                num_neg_examples=len(all_negative_examples),
+                avg_xba_reactivations=avg_xba_score_this_gen
             )
 
             # Phase 4: Mutation und Erzeugung der nächsten Generation
             next_generation_population = []
             # Übernehme die besten Modelle direkt (Eliten-Strategie)
-            # Kopiere die Top-Modelle, um sie nicht durch nachfolgende Mutationen zu beeinflussen.
-            for elite_item in self.selection_loop.get_population():
-                elite_model_copy = NCA_Model_3x3(NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS).to(DEVICE)
-                elite_model_copy.load_state_dict(elite_item['model'].state_dict())
-                next_generation_population.append(elite_model_copy)
+            # Models from get_population() are dicts {'model': model_instance, 'score': ...}
+            # The model_instance within this dict is a copy made by register_nca_model,
+            # which should have logbook and a copied model_id.
+            elites_dicts = self.selection_loop.get_population()
+            for elite_dict in elites_dicts:
+                next_generation_population.append(elite_dict['model']) # Add the model instance
 
             # Fülle den Rest der Population mit Mutationen der besten Modelle auf
-            # Mutiere von den bestehenden Modellen in der selection_loop (die bereits Kopien sind)
-            while len(next_generation_population) < self.population_size:
-                # Wähle ein zufälliges Modell aus der aktuellen Elite als Elternteil
-                parent_model = random.choice(self.selection_loop.get_population())['model']
-                mutated_child = self.mutation_engine.mutate(parent_model)
-                next_generation_population.append(mutated_child)
+            num_elites = len(next_generation_population)
+            num_mutants_to_create = self.population_size - num_elites
             
-            self.current_nca_population = next_generation_population
+            if elites_dicts: # Ensure there are elites to choose from for mutation
+                for i in range(num_mutants_to_create):
+                    parent_model_dict = random.choice(elites_dicts) # Choose from the list of elite dicts
+                    parent_model = parent_model_dict['model']
+                    # Create a new unique ID for the mutated child
+                    mutated_model_id = f"gen{generation+1}_mutant{i}_from_{parent_model.model_id}"
+                    mutated_child = self.mutation_engine.mutate(
+                        parent_model,
+                        logbook=self.logbook,
+                        new_model_id=mutated_model_id
+                    )
+                    next_generation_population.append(mutated_child)
+            else: # Fallback if no elites (e.g. first generation if selection loop was empty)
+                 # This case should ideally not happen if population_size > 0 and init_population ran
+                logger.warning(f"Generation {generation+1}: No elites found to mutate from. Filling with new models.")
+                for i in range(num_mutants_to_create):
+                    model_id = f"gen{generation+1}_newfill{i}"
+                    new_model = NCA_Model_3x3(
+                        NCA_STATE_CHANNELS, NCA_HIDDEN_CHANNELS, NCA_STATE_CHANNELS,
+                        logbook=self.logbook, model_id=model_id
+                    ).to(DEVICE)
+                    next_generation_population.append(new_model)
+
+            self.current_nca_population = next_generation_population[:self.population_size] # Ensure correct size
             logger.info(f"Generation {generation+1} abgeschlossen. Top NCA-Score dieser Population: {self.selection_loop.get_best_model()['score']:.2f}")
 
         logger.info("Evolution abgeschlossen. Das beste NCA-Modell ist verfügbar.")
@@ -963,46 +1286,108 @@ class Growth_Visualizer:
     """
     Zeigt die Entwicklung jeder Struktur frameweise an.
     """
-    def __init__(self, grid_size=NCA_GRID_SIZE):
+    def __init__(self, grid_size=NCA_GRID_SIZE, show_xba_effects=True, xba_highlight_color=None): # xba_highlight_color currently unused
         self.grid_size = grid_size
+        self.show_xba_effects = show_xba_effects
+        self.xba_highlight_color = xba_highlight_color # Placeholder for now
         self.fig, self.ax = plt.subplots(figsize=(grid_size/10, grid_size/10))
         self.im = self.ax.imshow(np.zeros((grid_size, grid_size, 3)), cmap='viridis')
         self.ax.axis('off')
         self.fig.tight_layout(pad=0)
         self.animation = None
 
-    def animate_growth(self, nca_model, num_steps=NCA_STEPS_PER_GROWTH, title="NCA Growth"):
+    def animate_growth(self, nca_model, num_steps=NCA_STEPS_PER_GROWTH, title="NCA Growth",
+                         xba_enabled_viz=False, xba_check_interval_viz=10,
+                         epsilon_viz=1e-6, std_threshold_viz=1e-4,
+                         reactivation_method_viz='reinitialize'):
         """
         Erzeugt eine Animation des NCA-Wachstumsprozesses.
         :param nca_model: Das NCA-Modell zur Simulation.
         :param num_steps: Anzahl der Simulationsschritte.
         :param title: Titel der Animation.
+        :param xba_enabled_viz: Ob XBA während der Visualisierung aktiv sein soll.
+        :param xba_check_interval_viz: Intervall für XBA-Prüfungen in der Visualisierung.
+        :param epsilon_viz: Epsilon für XBA in der Visualisierung.
+        :param std_threshold_viz: Std_threshold für XBA in der Visualisierung.
+        :param reactivation_method_viz: Reactivation-Methode für XBA in der Visualisierung.
         """
-        logger.info(f"Starte Visualisierung des NCA-Wachstums '{title}'...")
+        logger.info(f"Starte Visualisierung des NCA-Wachstums '{title}' (XBA Viz: {xba_enabled_viz})...")
         states_sequence = []
-        state = initial_seed_generator(self.grid_size, NCA_STATE_CHANNELS, batch_size=1, seed_type='center_pixel')
-        # to_rgb(state) gibt (1, 3, H, W) zurück, daher squeeze(0) für (3, H, W)
-        states_sequence.append(to_rgb(state).squeeze(0).cpu().numpy().transpose(1, 2, 0)) # Initialzustand
+        xba_messages_sequence = [] # To store XBA messages for each frame
 
-        with torch.no_grad():
+        original_xba_log_len = len(nca_model.xba_logging_data) if hasattr(nca_model, 'xba_logging_data') else 0
+
+        state = initial_seed_generator(self.grid_size, NCA_STATE_CHANNELS, batch_size=1, seed_type='center_pixel')
+        states_sequence.append(to_rgb(state).squeeze(0).cpu().numpy().transpose(1, 2, 0)) # Initialzustand
+        xba_messages_sequence.append("") # No XBA action at step 0
+
+        # Ensure model is in eval mode for visualization, but XBA might need std_output.
+        # The change in NCA_Model_3x3.forward to always calculate std_output helps here.
+        nca_model.eval()
+
+        with torch.no_grad(): # Visualization should not track gradients
             for i in range(num_steps):
-                state = nca_step_function(state, nca_model)
-                # to_rgb(state) gibt (1, 3, H, W) zurück, daher squeeze(0) für (3, H, W)
+                current_xba_message_parts = []
+
+                # Store length of XBA logs before potential XBA intervention for this step
+                # This helps in fetching only new logs generated in this step
+                log_len_before_this_step_xba = len(nca_model.xba_logging_data)
+
+                # Call nca_step_function - XBA logic within nca_step_function will run if xba_enabled_viz is True
+                # This is important as it calls model.forward() which populates std_outputs
+                state = nca_step_function(
+                    state, nca_model,
+                    current_step=i + 1,
+                    xba_enabled=xba_enabled_viz,
+                    xba_check_interval=xba_check_interval_viz,
+                    epsilon=epsilon_viz,
+                    std_threshold=std_threshold_viz,
+                    reactivation_method=reactivation_method_viz
+                )
+
+                # Collect XBA messages if XBA was active and did something *in this step*
+                # The XBA logic (identify/reactivate) is now inside nca_step_function.
+                # We need to retrieve messages logged by those calls for the *current* step.
+                if xba_enabled_viz and ((i + 1) % xba_check_interval_viz == 0):
+                    new_logs = nca_model.xba_logging_data[log_len_before_this_step_xba:]
+                    for log_entry in new_logs:
+                        if log_entry.get('type') == 'identification':
+                            current_xba_message_parts.append(
+                                f"XBA ID: {log_entry['layer']} ({len(log_entry['neurons'])} neurons)"
+                            )
+                        elif log_entry.get('type') == 'reactivation':
+                             current_xba_message_parts.append(
+                                f"XBA Act: {log_entry['layer']} ({log_entry['count']} by {log_entry['method']})"
+                            )
+
+                xba_messages_sequence.append("; ".join(current_xba_message_parts) if current_xba_message_parts else "")
                 states_sequence.append(to_rgb(state).squeeze(0).cpu().numpy().transpose(1, 2, 0))
+
                 if i % (num_steps // 10 or 1) == 0:
                     logger.debug(f"Visualisierung Fortschritt: {i+1}/{num_steps}")
 
-        # Für die Animation muss frame_idx als Liste übergeben werden, damit es in der Closure änderbar ist.
-        # oder einfacher: nutze die index-variable, die FuncAnimation selbst übergibt.
-        def update(frame_data, frame_idx_val):
+        # Clean up any XBA logs generated *only* for this visualization run, if desired
+        # For simplicity, we are not doing that here. If xba_logging_data grows too large,
+        # one might consider passing a temporary list or filtering by a run_id.
+
+        def update(frame_info):
+            frame_idx_val, frame_data, xba_msg = frame_info # Unpack
             self.im.set_data(frame_data)
-            self.ax.set_title(f"{title}\nStep: {frame_idx_val}")
+            full_title = f"{title}\nStep: {frame_idx_val}"
+            if self.show_xba_effects and xba_msg:
+                full_title += f"\n{xba_msg}"
+            self.ax.set_title(full_title)
             return self.im,
 
-        self.animation = FuncAnimation(self.fig, lambda frame_data, idx: update(frame_data, idx), 
-                                       frames=zip(states_sequence, range(len(states_sequence))), # Pass both data and index
+        # Create frames by zipping states, messages, and step numbers
+        # Step numbers for display should start from 0 or 1 as per convention.
+        # range(len(states_sequence)) makes step_idx_val go from 0 to num_steps.
+        animation_frames = zip(range(len(states_sequence)), states_sequence, xba_messages_sequence)
+
+        self.animation = FuncAnimation(self.fig, update,
+                                       frames=animation_frames,
                                        interval=1000/VISUALIZATION_FPS, blit=True)
-        plt.show(block=False) # Nicht blockieren, um andere Operationen zu ermöglichen
+        plt.show(block=False)
         logger.info(f"Visualisierung abgeschlossen. Titel: {title}")
 
     def save_animation(self, filename="nca_growth.gif"):
@@ -1074,19 +1459,52 @@ class Logbook:
         # Verwenden Sie den bereits initialisierten Logger für dieses Modul
         self.logger = logging.getLogger(__name__) 
 
-    def log_generation_summary(self, generation, best_score, avg_score, num_pos_examples, num_neg_examples):
+    def log_generation_summary(self, generation, best_score, avg_score, num_pos_examples, num_neg_examples, avg_xba_reactivations=0.0):
         """Protokolliert eine Zusammenfassung der Generation."""
         self.logger.info(f"--- Generationszusammenfassung {generation} ---")
         self.logger.info(f"  Bester Modell-Score: {best_score:.4f}")
         self.logger.info(f"  Durchschnittlicher Population-Score: {avg_score:.4f}")
         self.logger.info(f"  Gesammelte Positivbeispiele für Validator: {num_pos_examples}")
         self.logger.info(f"  Gesammelte Negativbeispiele für Validator: {num_neg_examples}")
+        self.logger.info(f"  Durchschnittliche XBA-Reaktivierungen: {avg_xba_reactivations:.2f}")
         self.logger.info("----------------------------------")
 
     def log_model_selection(self, model_id, score, is_selected):
         """Protokolliert die Auswahl eines Modells."""
         status = "Ausgewählt" if is_selected else "Nicht ausgewählt"
         self.logger.debug(f"Modell {model_id}: Score {score:.4f} - Status: {status}")
+
+    def log_xba_identification(self, timestamp, model_id, layer_name, neuron_indices, details=""):
+        """Protokolliert die Identifizierung toter Neuronen durch XBA."""
+        # Ensure neuron_indices is a list for consistent logging
+        if isinstance(neuron_indices, torch.Tensor):
+            neuron_indices_list = neuron_indices.tolist()
+        elif isinstance(neuron_indices, np.ndarray):
+            neuron_indices_list = neuron_indices.tolist()
+        else:
+            neuron_indices_list = neuron_indices # Assuming it's already a list or similar
+
+        log_message = (
+            f"[XBA ID] Timestamp: {timestamp} | Model ID: {model_id} | Layer: {layer_name} | "
+            f"Identified Neurons: {neuron_indices_list} | Details: {details}"
+        )
+        self.logger.info(log_message)
+
+    def log_xba_action(self, timestamp, model_id, layer_name, neuron_indices, action_type, details=""):
+        """Protokolliert eine XBA-Reaktivierungsaktion."""
+        # Ensure neuron_indices is a list for consistent logging
+        if isinstance(neuron_indices, torch.Tensor):
+            neuron_indices_list = neuron_indices.tolist()
+        elif isinstance(neuron_indices, np.ndarray):
+            neuron_indices_list = neuron_indices.tolist()
+        else:
+            neuron_indices_list = neuron_indices # Assuming it's already a list or similar
+
+        log_message = (
+            f"[XBA Action] Timestamp: {timestamp} | Model ID: {model_id} | Layer: {layer_name} | "
+            f"Neurons: {neuron_indices_list} | Action: {action_type} | Details: {details}"
+        )
+        self.logger.info(log_message)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -1138,4 +1556,213 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True # Beschleunigt Convs, wenn Input-Größe konstant ist
 
-    main()
+    # main() # Comment out main execution for tests
+
+    # --- XBA Test Suite ---
+    test_logbook = Logbook() # Global logbook for tests
+
+    def create_test_model(logbook_instance=None, model_id="test_model_default"):
+        # Use smaller channel numbers for faster tests if desired, but stick to config for now
+        model = NCA_Model_3x3(
+            NCA_STATE_CHANNELS,
+            NCA_HIDDEN_CHANNELS,
+            NCA_STATE_CHANNELS,
+            logbook=logbook_instance,
+            model_id=model_id
+        ).to(DEVICE)
+        model.eval() # Default to eval mode for tests unless training specific parts
+        return model
+
+    def test_identify_dead_neurons():
+        print("\nRunning test_identify_dead_neurons...")
+        model = create_test_model(logbook_instance=test_logbook, model_id="identify_test")
+        epsilon = 0.01
+        std_threshold = 0.01
+
+        # All healthy
+        model.mean_abs_grad_conv1.fill_(0.1)
+        model.std_output_conv1.fill_(0.1)
+        model.mean_abs_grad_conv2.fill_(0.1)
+        model.std_output_conv2.fill_(0.1)
+        dead1, dead2 = model.identify_dead_neurons(epsilon, std_threshold)
+        assert dead1.numel() == 0, "Test Case 1.1 Failed: All healthy conv1"
+        assert dead2.numel() == 0, "Test Case 1.2 Failed: All healthy conv2"
+        print("  Test Case 1 (All Healthy): Passed")
+
+        # Some dead in conv1
+        model.mean_abs_grad_conv1[0] = 0.001
+        model.std_output_conv1[0] = 0.001
+        model.mean_abs_grad_conv1[1] = 0.002
+        model.std_output_conv1[1] = 0.002
+        dead1, dead2 = model.identify_dead_neurons(epsilon, std_threshold)
+        assert dead1.numel() == 2 and 0 in dead1 and 1 in dead1, f"Test Case 2.1 Failed: Some dead conv1. Got: {dead1.tolist()}"
+        assert dead2.numel() == 0, "Test Case 2.2 Failed: All healthy conv2 (error in conv1 test)"
+        print("  Test Case 2 (Some Dead Conv1): Passed")
+
+        # Check logs (simple check for entries in model's own log)
+        assert any("identification" in entry.get('type', "") for entry in model.xba_logging_data if isinstance(entry, dict)), "Test Case 2.3 Failed: identification log missing"
+        model.xba_logging_data.clear() # Clear for next test part
+
+        # Low MAG, high StdOut (healthy)
+        model.mean_abs_grad_conv1[2] = 0.001
+        model.std_output_conv1[2] = 0.1 # Healthy std_output
+        dead1, dead2 = model.identify_dead_neurons(epsilon, std_threshold)
+        assert 2 not in dead1, "Test Case 3.1 Failed: Low MAG, high StdOut should be healthy"
+        print("  Test Case 3 (Low MAG, High StdOut): Passed")
+
+        # High MAG, low StdOut (healthy)
+        model.mean_abs_grad_conv1[3] = 0.1
+        model.std_output_conv1[3] = 0.001 # Healthy MAG
+        dead1, dead2 = model.identify_dead_neurons(epsilon, std_threshold)
+        assert 3 not in dead1, "Test Case 4.1 Failed: High MAG, low StdOut should be healthy"
+        print("  Test Case 4 (High MAG, Low StdOut): Passed")
+        print("test_identify_dead_neurons: All tests passed.")
+
+    def test_reactivate_neurons_reinitialize():
+        print("\nRunning test_reactivate_neurons_reinitialize...")
+        model = create_test_model(logbook_instance=test_logbook, model_id="reinit_test")
+        dead_indices_c1 = torch.tensor([0, 1], device=DEVICE).long()
+        dead_indices_c2 = torch.tensor([2, 3], device=DEVICE).long()
+
+        initial_weights_c1_dead0 = model.conv1.weight.data[0].clone()
+        initial_weights_c2_dead2 = model.conv2.weight.data[2].clone()
+
+        model.reactivate_neurons(dead_indices_c1, dead_indices_c2, 'reinitialize')
+
+        assert not torch.equal(model.conv1.weight.data[0], initial_weights_c1_dead0), "Test Case 1.1 Failed: Conv1 neuron 0 not reinitialized"
+        assert not torch.equal(model.conv2.weight.data[2], initial_weights_c2_dead2), "Test Case 1.2 Failed: Conv2 neuron 2 not reinitialized"
+        # Check if bias (if exists) was zeroed
+        if model.conv1.bias is not None:
+            assert torch.all(model.conv1.bias.data[dead_indices_c1] == 0), "Test Case 1.3 Failed: Conv1 bias not zeroed"
+        print("  Test Case 1 (Weights Changed & Bias Zeroed): Passed")
+
+        # Check logs
+        react_logs = [log for log in model.xba_logging_data if isinstance(log, dict) and log.get('type') == 'reactivation']
+        assert len(react_logs) >= 1, "Test Case 1.4 Failed: Reactivation log missing/incomplete"
+        assert any(log['layer'] == 'conv1' and log['method'] == 'reinitialize' for log in react_logs), "Test Case 1.5 Failed: Conv1 reinit log incorrect"
+        assert any(log['layer'] == 'conv2' and log['method'] == 'reinitialize' for log in react_logs), "Test Case 1.6 Failed: Conv2 reinit log incorrect"
+        print("  Test Case 2 (Logging): Passed")
+        print("test_reactivate_neurons_reinitialize: All tests passed.")
+
+    def test_reactivate_neurons_inject_noise():
+        print("\nRunning test_reactivate_neurons_inject_noise...")
+        model = create_test_model(logbook_instance=test_logbook, model_id="noise_test")
+        dead_indices_c1 = torch.tensor([0], device=DEVICE).long()
+        dead_indices_c2 = torch.tensor([], device=DEVICE).long() # No dead neurons for conv2 this time
+
+        initial_weights_c1_dead0 = model.conv1.weight.data[0].clone()
+        # Sum of weights before adding noise (as a simple check)
+        sum_before = initial_weights_c1_dead0.sum()
+
+        model.reactivate_neurons(dead_indices_c1, dead_indices_c2, 'inject_noise')
+
+        sum_after = model.conv1.weight.data[0].sum()
+        # Weights should have changed, but not drastically (noise is small)
+        assert not torch.equal(model.conv1.weight.data[0], initial_weights_c1_dead0), "Test Case 1.1 Failed: Conv1 neuron 0 weights did not change"
+        assert not torch.isclose(sum_before, sum_after, atol=1e-5), "Test Case 1.2 Failed: Sum of weights likely unchanged, noise might be zero."
+        print("  Test Case 1 (Weights Changed by Noise): Passed")
+
+        # Check logs
+        react_logs = [log for log in model.xba_logging_data if isinstance(log, dict) and log.get('type') == 'reactivation']
+        assert len(react_logs) >= 1, "Test Case 2.1 Failed: Reactivation log missing"
+        assert any(log['layer'] == 'conv1' and log['method'] == 'inject_noise' for log in react_logs), "Test Case 2.2 Failed: Conv1 inject_noise log incorrect"
+        print("  Test Case 2 (Logging): Passed")
+        print("test_reactivate_neurons_inject_noise: All tests passed.")
+
+    def test_xba_hooks_and_stats_collection():
+        print("\nRunning test_xba_hooks_and_stats_collection...")
+        # Use a model configured for training to ensure hooks are active and grads are computed
+        model = create_test_model(logbook_instance=test_logbook, model_id="hooks_test")
+        model.train() # Set to train mode for gradients
+
+        # Dummy input and loss calculation for backward pass
+        # Use smaller grid for test speed if NCA_GRID_SIZE is large
+        test_grid_size = 16
+        dummy_state = torch.randn(2, NCA_STATE_CHANNELS, test_grid_size, test_grid_size, device=DEVICE, requires_grad=True)
+
+        # Perform forward pass
+        output_delta = model(dummy_state)
+
+        # Assert std_outputs are populated (not all zeros)
+        # These are calculated during forward pass if model.train() or if requires_grad is true on input
+        assert model.std_output_conv1.abs().sum() > 1e-9, "Test Case 1.1 Failed: std_output_conv1 not populated"
+        assert model.std_output_conv2.abs().sum() > 1e-9, "Test Case 1.2 Failed: std_output_conv2 not populated"
+        print("  Test Case 1 (StdDev Output Collection): Passed")
+
+        # Create a dummy loss and perform backward pass
+        loss = output_delta.sum()
+        loss.backward()
+
+        # Assert mean_abs_grads are populated (not all zeros)
+        assert model.mean_abs_grad_conv1.abs().sum() > 1e-9, "Test Case 2.1 Failed: mean_abs_grad_conv1 not populated by hook"
+        assert model.mean_abs_grad_conv2.abs().sum() > 1e-9, "Test Case 2.2 Failed: mean_abs_grad_conv2 not populated by hook"
+        print("  Test Case 2 (Gradient Hook Collection): Passed")
+
+        model.remove_hooks() # Test hook removal
+        assert model._conv1_hook_handle is None and model._conv2_hook_handle is None, "Test Case 3.1 Failed: Hooks not removed"
+        print("  Test Case 3 (Hook Removal): Passed")
+
+        print("test_xba_hooks_and_stats_collection: All tests passed.")
+
+
+    def test_xba_integration_in_nca_step():
+        print("\nRunning test_xba_integration_in_nca_step...")
+        model = create_test_model(logbook_instance=test_logbook, model_id="integration_test")
+        model.train() # XBA typically runs during training
+
+        test_grid_size = 16
+        # Use a zero initial state to try and force std_output to be zero.
+        # This assumes biases are zero or near zero after initialization for conv1.
+        initial_state = torch.zeros(1, NCA_STATE_CHANNELS, test_grid_size, test_grid_size, device=DEVICE)
+
+        # Setup conditions for XBA to trigger for conv1 neuron 0
+        # mean_abs_grad is manually set. std_output will be calculated by model(state) call
+        # inside nca_step_function. With zero input, std_output should be zero.
+        model.mean_abs_grad_conv1.fill_(0.1) # Make other neurons healthy
+        model.mean_abs_grad_conv1[0] = 1e-8  # This neuron's MAG is dead
+
+        # std_output will be determined by the forward pass.
+        # We expect std_output_conv1[0] to be ~0 due to zero input state.
+
+        initial_weights_c1_dead0 = model.conv1.weight.data[0].clone()
+
+        # Call nca_step_function where XBA should activate
+        _ = nca_step_function(
+            initial_state, model,
+            current_step=10, # current_step % xba_check_interval == 0
+            xba_enabled=True,
+            xba_check_interval=10,
+            epsilon=1e-7, # Ensure our setup triggers this
+            std_threshold=1e-5, # Ensure our setup triggers this
+            reactivation_method='reinitialize'
+        )
+
+        # Assert that reactivate_neurons was effectively called for conv1 neuron 0
+        # 1. Check if weights changed
+        assert not torch.equal(model.conv1.weight.data[0], initial_weights_c1_dead0), "Test Case 1.1 Failed: Weights of dead neuron did not change"
+
+        # 2. Check model's internal XBA log for reactivation entry
+        react_log_found = False
+        for log_entry in model.xba_logging_data:
+            if isinstance(log_entry, dict) and \
+               log_entry.get('type') == 'reactivation' and \
+               log_entry.get('layer') == 'conv1' and \
+               0 in log_entry.get('neurons', []):
+                react_log_found = True
+                break
+        assert react_log_found, "Test Case 1.2 Failed: Reactivation log for conv1 neuron 0 not found in model.xba_logging_data"
+        print("  Test Case 1 (XBA Triggered and Neuron Reactivated): Passed")
+
+        print("test_xba_integration_in_nca_step: All tests passed.")
+
+    def run_all_xba_tests():
+        print("--- Starting XBA Test Suite ---")
+        test_identify_dead_neurons()
+        test_reactivate_neurons_reinitialize()
+        test_reactivate_neurons_inject_noise()
+        test_xba_hooks_and_stats_collection()
+        test_xba_integration_in_nca_step()
+        print("\n--- XBA Test Suite Completed ---")
+
+    # Instead of main(), run the tests directly if this script is executed
+    run_all_xba_tests()

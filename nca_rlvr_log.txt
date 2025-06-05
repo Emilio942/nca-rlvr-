@@ -1,0 +1,10 @@
+2025-06-05 13:14:37,195 - INFO - [XBA ID] Timestamp: 2025-06-05 13:14:37 | Model ID: identify_test | Layer: conv1 | Identified Neurons: [0, 1] | Details: MAG_mean=1.50e-03, StdOut_mean=1.50e-03
+2025-06-05 13:14:37,196 - INFO - [XBA ID] Timestamp: 2025-06-05 13:14:37 | Model ID: identify_test | Layer: conv1 | Identified Neurons: [0, 1] | Details: MAG_mean=1.50e-03, StdOut_mean=1.50e-03
+2025-06-05 13:14:37,196 - INFO - [XBA ID] Timestamp: 2025-06-05 13:14:37 | Model ID: identify_test | Layer: conv1 | Identified Neurons: [0, 1] | Details: MAG_mean=1.50e-03, StdOut_mean=1.50e-03
+2025-06-05 13:14:37,197 - INFO - [XBA Action] Timestamp: 2025-06-05 13:14:37 | Model ID: reinit_test | Layer: conv1 | Neurons: [0, 1] | Action: reinitialize | Details: 2 neurons affected
+2025-06-05 13:14:37,198 - INFO - [XBA Action] Timestamp: 2025-06-05 13:14:37 | Model ID: reinit_test | Layer: conv2 | Neurons: [2, 3] | Action: reinitialize | Details: 2 neurons affected
+2025-06-05 13:14:37,199 - INFO - [XBA Action] Timestamp: 2025-06-05 13:14:37 | Model ID: noise_test | Layer: conv1 | Neurons: [0] | Action: inject_noise | Details: 1 neurons affected
+2025-06-05 13:14:37,211 - INFO - [XBA ID] Timestamp: 2025-06-05 13:14:37 | Model ID: integration_test | Layer: conv1 | Identified Neurons: [0] | Details: MAG_mean=1.00e-08, StdOut_mean=0.00e+00
+2025-06-05 13:14:37,211 - INFO - [XBA Interv@step 10] Identifying dead neurons. Conv1: [0], Conv2: []
+2025-06-05 13:14:37,211 - INFO - [XBA Action] Timestamp: 2025-06-05 13:14:37 | Model ID: integration_test | Layer: conv1 | Neurons: [0] | Action: reinitialize | Details: 1 neurons affected
+2025-06-05 13:14:37,211 - INFO - [XBA Interv@step 10] Attempted reactivation using 'reinitialize'.
